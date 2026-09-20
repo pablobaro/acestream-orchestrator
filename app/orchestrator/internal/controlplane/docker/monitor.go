@@ -229,15 +229,22 @@ func Reindex(ctx context.Context) bool {
 			}
 
 			if _, exists := st.GetVPNNode(containerName); !exists {
-				provider := strings.ToLower(strings.TrimSpace(attrs["provider"]))
+				// These are the label keys the VPN provisioner actually writes
+				// (see vpn.buildLabels). Reading the unprefixed names silently
+				// yielded an empty provider, an empty protocol and
+				// port-forwarding=false on every adopted node.
+				provider := strings.ToLower(strings.TrimSpace(attrs["acestream.vpn.provider"]))
+				protocol := strings.ToLower(strings.TrimSpace(attrs["acestream.vpn.protocol"]))
 				node := &state.VPNNode{
 					ContainerName:           containerName,
 					ContainerID:             c.ID,
 					Status:                  "running",
 					Healthy:                 false,
 					Provider:                provider,
+					Protocol:                protocol,
+					CredentialID:            attrs["acestream.vpn.credential_id"],
 					ManagedDynamic:          isDynamicVPN,
-					PortForwardingSupported: attrs["port_forwarding_supported"] == "true",
+					PortForwardingSupported: attrs["acestream.vpn.port_forwarding_supported"] == "true",
 					Lifecycle:               "active",
 					ControlHost:             controlHost,
 				}
