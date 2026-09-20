@@ -118,6 +118,25 @@ func (cs *ClientStreamer) Stream(ctx context.Context) {
 			emptyCount = 0
 		}
 
+		// A client that cannot drain as fast as the engine fills eventually
+		// falls off the back of the ring. WriteAfterTo clamps silently in that
+		// case, so the client receives a hard cut in the middle of the stream
+		// with nothing marking it and keeps being lapped every few seconds.
+		// Jumping to the live edge makes the loss explicit and bounded —
+		// resuming at the oldest chunk would leave it a full ring behind and
+		// lapped again immediately.
+		if lost := chunksLapped(cs.localIndex, cs.buf.Oldest()); lost > 0 {
+			head := cs.buf.Head()
+			if head < 0 {
+				head = 0
+			}
+			slog.Warn("client fell behind the ring, skipping to the live edge",
+				"stream", cs.contentID, "client", cs.clientID,
+				"chunks_lost", lost, "old_index", cs.localIndex, "new_index", head,
+				"seconds_behind", cs.secondsBehind())
+			cs.localIndex = head
+		}
+
 		n, newIdx, err := cs.buf.WriteAfterTo(cs.localIndex, 15, cs.w)
 		if n > 0 {
 			emptyCount = 0
@@ -250,15 +269,34 @@ func (cs *ClientStreamer) applyPrebuffer(ctx context.Context, seconds int) {
 	slog.Info("prebuffer timeout reached", "stream", cs.contentID, "client", cs.clientID)
 }
 
-func (cs *ClientStreamer) updateClientPosition() {
+// chunksLapped reports how many chunks were overwritten before the client could
+// send them. Zero while the cursor is still inside the ring.
+func chunksLapped(localIndex, oldest int64) int64 {
+	next := localIndex + 1 // the client reads from the chunk after its cursor
+	if next >= oldest {
+		return 0
+	}
+	return oldest - next
+}
+
+// secondsBehind estimates how far the client trails the live edge, from the
+// PCR-derived bitrate. Zero until that measurement is stable, since a guess
+// here would be reported as fact.
+func (cs *ClientStreamer) secondsBehind() float64 {
 	bps := cs.buf.VideoBitrate()
 	if bps < pcrMinStableBPS {
-		return
+		return 0
 	}
 	runway := cs.buf.Head() - cs.localIndex
 	if runway < 0 {
 		runway = 0
 	}
-	secondsBehind := float64(runway) * float64(cs.buf.TargetChunkSize()) / bps
-	cs.cm.UpdatePosition(cs.clientID, secondsBehind)
+	return float64(runway) * float64(cs.buf.TargetChunkSize()) / bps
+}
+
+func (cs *ClientStreamer) updateClientPosition() {
+	if cs.buf.VideoBitrate() < pcrMinStableBPS {
+		return
+	}
+	cs.cm.UpdatePosition(cs.clientID, cs.secondsBehind())
 }

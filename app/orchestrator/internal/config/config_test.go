@@ -50,3 +50,20 @@ func TestWarnTimeoutOrdering_FlagsShortShutdownDelay(t *testing.T) {
 		t.Errorf("expected a warning about the channel shutdown delay, got:\n%s", out)
 	}
 }
+
+// Settings stored in SQLite override these timeouts at runtime, so a saved
+// value can reintroduce exactly what the startup check exists to catch.
+func TestApplySettings_RechecksTimeoutOrdering(t *testing.T) {
+	prev := C.Load()
+	t.Cleanup(func() { C.Store(prev) })
+
+	out := captureWarnings(func() {
+		ApplySettings(map[string]any{"upstream_read_timeout": 300})
+	})
+	if !strings.Contains(out, "UPSTREAM_READ_TIMEOUT_S") {
+		t.Errorf("ApplySettings must re-check the timeout ordering, got:\n%s", out)
+	}
+	if got := C.Load().UpstreamReadTimeout; got != 300*time.Second {
+		t.Errorf("setting must still be applied: got %v", got)
+	}
+}

@@ -264,6 +264,10 @@ func ApplySettings(m map[string]any) {
 			n.MaxTotalStreams = toInt(v)
 		}
 	}
+	// Stored settings override upstream_read_timeout and channel_shutdown_delay,
+	// so the ordering has to be re-checked here too — otherwise a saved value
+	// silently reintroduces what the startup check exists to catch.
+	warnTimeoutOrdering(&n)
 	C.Store(&n)
 }
 
@@ -474,14 +478,14 @@ func load() *Config {
 		// reader never gets to retry before every watching client has already
 		// given up. See warnTimeoutOrdering.
 		UpstreamReadTimeout: envDur("UPSTREAM_READ_TIMEOUT_S", 20*time.Second),
-		ClientWaitTimeout:      envDur("CLIENT_WAIT_TIMEOUT_S", 60*time.Second),
-		StreamTimeout:          envDur("STREAM_TIMEOUT_S", 60*time.Second),
-		ChunkTimeout:           envDur("CHUNK_TIMEOUT_S", 5*time.Second),
+		ClientWaitTimeout:   envDur("CLIENT_WAIT_TIMEOUT_S", 60*time.Second),
+		StreamTimeout:       envDur("STREAM_TIMEOUT_S", 60*time.Second),
+		ChunkTimeout:        envDur("CHUNK_TIMEOUT_S", 5*time.Second),
 		// A player that drops out and reconnects has to find its stream still
 		// here. Tearing it down builds a new HLS segmenter, whose sequence
 		// numbers restart at zero — to the player that is a brand new playlist,
 		// so it reloads from the beginning and replays what it already watched.
-		ChannelShutdownDelay: envDur("CHANNEL_SHUTDOWN_DELAY_S", 30*time.Second),
+		ChannelShutdownDelay:   envDur("CHANNEL_SHUTDOWN_DELAY_S", 30*time.Second),
 		ChannelInitGracePeriod: envDur("CHANNEL_INIT_GRACE_PERIOD_S", 30*time.Second),
 		KeepaliveInterval:      envDur("KEEPALIVE_INTERVAL_MS", 500*time.Millisecond),
 

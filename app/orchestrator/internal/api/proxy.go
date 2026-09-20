@@ -39,8 +39,8 @@ type ProxyServer struct {
 	hub        *stream.Hub
 	panelToken string // random token set at startup; grants panel-session cookie auth
 	st         *state.Store
-	settings *persistence.SettingsStore
-	mux      *http.ServeMux
+	settings   *persistence.SettingsStore
+	mux        *http.ServeMux
 
 	// controlplane subsystems (direct in-process calls, no HTTP)
 	ctrl       *cpengine.Controller

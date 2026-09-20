@@ -203,6 +203,18 @@ func (rb *RingBuffer) Head() int64 {
 	return h
 }
 
+// Oldest returns the lowest chunk index the ring still holds. Anything below
+// it has been overwritten by newer data.
+func (rb *RingBuffer) Oldest() int64 {
+	rb.mu.RLock()
+	o := rb.head - int64(rb.cap)
+	rb.mu.RUnlock()
+	if o < 0 {
+		return 0
+	}
+	return o
+}
+
 // ReadAfter returns all chunks with index > afterIndex (up to maxChunks).
 // Returns the last index seen (for cursor advancement).
 // Returns nil, -1 if no new chunks are available.
