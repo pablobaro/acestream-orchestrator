@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -448,7 +449,7 @@ func load() *Config {
 	labelRaw := envStr("CONTAINER_LABEL", "ondemand.app=myservice")
 	labelKey, labelVal, _ := strings.Cut(labelRaw, "=")
 
-	return &Config{
+	c := &Config{
 		RedisHost: envStr("REDIS_HOST", "localhost"),
 		RedisPort: envInt("REDIS_PORT", 6379),
 		RedisDB:   envInt("REDIS_DB", 0),
@@ -463,11 +464,19 @@ func load() *Config {
 		SSEUpdateInterval:     envDur("SSE_UPDATE_INTERVAL_S", 1*time.Second),
 
 		UpstreamConnectTimeout: envDur("UPSTREAM_CONNECT_TIMEOUT_S", 3*time.Second),
-		UpstreamReadTimeout:    envDur("UPSTREAM_READ_TIMEOUT_S", 90*time.Second),
+		// Must stay comfortably below the client no-data window
+		// (NoDataTimeoutChecks × NoDataCheckInterval, 60s by default), or the
+		// reader never gets to retry before every watching client has already
+		// given up. See warnTimeoutOrdering.
+		UpstreamReadTimeout: envDur("UPSTREAM_READ_TIMEOUT_S", 20*time.Second),
 		ClientWaitTimeout:      envDur("CLIENT_WAIT_TIMEOUT_S", 60*time.Second),
 		StreamTimeout:          envDur("STREAM_TIMEOUT_S", 60*time.Second),
 		ChunkTimeout:           envDur("CHUNK_TIMEOUT_S", 5*time.Second),
-		ChannelShutdownDelay:   envDur("CHANNEL_SHUTDOWN_DELAY_S", 5*time.Second),
+		// A player that drops out and reconnects has to find its stream still
+		// here. Tearing it down builds a new HLS segmenter, whose sequence
+		// numbers restart at zero — to the player that is a brand new playlist,
+		// so it reloads from the beginning and replays what it already watched.
+		ChannelShutdownDelay: envDur("CHANNEL_SHUTDOWN_DELAY_S", 30*time.Second),
 		ChannelInitGracePeriod: envDur("CHANNEL_INIT_GRACE_PERIOD_S", 30*time.Second),
 		KeepaliveInterval:      envDur("KEEPALIVE_INTERVAL_MS", 500*time.Millisecond),
 
@@ -590,6 +599,37 @@ func load() *Config {
 		ReputationAutoQuarantineFor: envDur("REPUTATION_AUTO_QUARANTINE_FOR", 3600*time.Second),
 		ReputationExplorationC:      envFloat("REPUTATION_EXPLORATION_C", 0.3),
 		ReputationPickTopN:          envInt("REPUTATION_PICK_TOP_N", 5),
+	}
+
+	warnTimeoutOrdering(c)
+	return c
+}
+
+// warnTimeoutOrdering reports timeout settings that cancel each other out.
+//
+// These are not invalid values, so the process still starts — but each one
+// silently disables machinery elsewhere, and the resulting behaviour looks like
+// a network fault rather than a configuration mistake.
+func warnTimeoutOrdering(c *Config) {
+	clientNoData := time.Duration(c.NoDataTimeoutChecks) * c.NoDataCheckInterval
+
+	// The reader only retries once a body read has been idle for
+	// UpstreamReadTimeout. If clients give up first, the retry path can never
+	// recover a stream anyone is still watching.
+	if clientNoData > 0 && c.UpstreamReadTimeout >= clientNoData {
+		slog.Warn("UPSTREAM_READ_TIMEOUT_S is not shorter than the client no-data window: "+
+			"clients will disconnect before the upstream reader retries",
+			"upstream_read_timeout", c.UpstreamReadTimeout,
+			"client_no_data_window", clientNoData)
+	}
+
+	// A stream torn down between a player's disconnect and its reconnect comes
+	// back with a fresh HLS segmenter, so the media sequence restarts at zero
+	// and the player treats the playlist as new.
+	if c.ChannelShutdownDelay < 15*time.Second {
+		slog.Warn("CHANNEL_SHUTDOWN_DELAY_S is short enough that a reconnecting player "+
+			"can lose its stream, restarting the HLS media sequence at zero",
+			"channel_shutdown_delay", c.ChannelShutdownDelay)
 	}
 }
 
