@@ -29,6 +29,7 @@ type LifecycleManager struct {
 	nudge          chan struct{}
 	nudger         func(string)
 	engineStopper  func(context.Context, string)
+	missingSince   missingSinceTracker
 	wg             sync.WaitGroup
 }
 
@@ -470,18 +471,48 @@ func (lm *LifecycleManager) monitorHealth(ctx context.Context) {
 		if !node.ManagedDynamic || node.Lifecycle == "draining" {
 			continue
 		}
-		// Probe Gluetun API.
-		healthy := IsControlAPIReachable(node.ContainerName, true)
+		// Docker already told us the container is gone; its IP now belongs to
+		// nobody, so dialing it just burns the probe timeout on every tick.
+		// The reaper removes these shortly after.
+		if node.Status == "down" {
+			continue
+		}
+		// Probe Gluetun API. The probe reports *why* it failed: a dial timeout,
+		// a refused connection, a DNS miss and a reachable-but-disconnected
+		// tunnel each point at a different fix, and a bare healthy=false makes
+		// them indistinguishable in the logs.
+		probe := ProbeControlAPI(node.ContainerName, true)
+		healthy := probe.Connected
+		if !healthy {
+			slog.Debug("VPN control-API probe failed",
+				"name", node.ContainerName,
+				"protocol", node.Protocol,
+				"control_host", node.ControlHost,
+				"reason", probe.Reason,
+				"reachable", probe.Reachable,
+				"detail", probe.Detail,
+			)
+		}
 		if node.Healthy != healthy {
-			slog.Info("VPN node health changed", "name", node.ContainerName, "healthy", healthy)
+			slog.Info("VPN node health changed",
+				"name", node.ContainerName,
+				"healthy", healthy,
+				"protocol", node.Protocol,
+				"reason", probe.Reason,
+				"detail", probe.Detail,
+			)
 			st.SetVPNNodeHealthy(node.ContainerName, healthy)
 			state.RecordEvent(state.EventEntry{
 				EventType: "vpn",
 				Category:  "health",
 				Message:   "VPN node health changed",
 				Details: map[string]any{
-					"name":    node.ContainerName,
-					"healthy": healthy,
+					"name":      node.ContainerName,
+					"healthy":   healthy,
+					"protocol":  node.Protocol,
+					"reason":    probe.Reason,
+					"reachable": probe.Reachable,
+					"detail":    probe.Detail,
 				},
 			})
 			// Publish update so proxy event stream reflects health.
@@ -516,12 +547,12 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 			continue
 		}
 		observed[name] = true
+		lm.missingSince.observed(name)
 
-		existing, exists := st.GetVPNNode(name)
-		if exists {
+		if _, exists := st.GetVPNNode(name); exists {
 			// Update status/LastSeen but don't overwrite lifecycle/health state.
-			existing.Status, _ = n["status"].(string)
-			existing.LastSeen = now
+			status, _ := n["status"].(string)
+			st.SetVPNNodeStatus(name, status)
 			continue
 		}
 
@@ -546,15 +577,58 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 		})
 	}
 
-	// Mark nodes gone from Docker as down.
+	// Reconcile nodes Docker no longer reports.
+	//
+	// Marking them down is not enough on its own: monitorHealth iterates every
+	// managed node and would keep dialing the dead container's IP, which times
+	// out on every tick and pins the health badge to DOWN forever. Nodes whose
+	// container is genuinely gone have to leave the store.
 	for _, node := range st.ListDynamicVPNNodes() {
-		if !observed[node.ContainerName] && node.Lifecycle != "draining" {
-			node.Status = "down"
-			node.LastSeen = now
+		if observed[node.ContainerName] {
+			continue
+		}
+
+		name := node.ContainerName
+		firstMissed := lm.missingSince.firstMissed(name, now)
+
+		switch classifyMissingNode(node.Lifecycle, firstMissed, now, missingNodeReapGrace) {
+		case missingNodeKeep:
+			// Draining nodes belong to the drain path.
+		case missingNodeMarkDown:
+			st.SetVPNNodeStatus(name, "down")
+		case missingNodeReap:
+			lm.reapMissingNode(ctx, name, now.Sub(firstMissed))
 		}
 	}
 
 	return nil
+}
+
+// reapMissingNode removes a dynamic VPN node whose container has been absent
+// from Docker for longer than the grace window, along with the engines bound to
+// it. The container is already gone, so there is nothing left to stop — this is
+// state cleanup only.
+func (lm *LifecycleManager) reapMissingNode(ctx context.Context, name string, missingFor time.Duration) {
+	slog.Warn("Reaping VPN node whose container disappeared from Docker",
+		"name", name, "missing_for", missingFor.Round(time.Second))
+
+	if lm.engineStopper != nil {
+		lm.engineStopper(ctx, name)
+	}
+	state.Global.RemoveEnginesByVPN(name)
+	state.Global.RemoveVPNNode(name)
+	lm.missingSince.observed(name)
+	lm.pub.RemoveVPNNode(ctx, name)
+
+	state.RecordEvent(state.EventEntry{
+		EventType: "vpn",
+		Category:  "reaped",
+		Message:   "VPN node removed: container no longer exists in Docker",
+		Details: map[string]any{
+			"name":        name,
+			"missing_for": missingFor.Round(time.Second).String(),
+		},
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

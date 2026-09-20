@@ -472,6 +472,19 @@ func (s *Store) SetVPNNodeCondition(name, condition string) {
 	}
 }
 
+// SetVPNNodeStatus updates a VPN node's Docker-reported status under the store
+// lock. Callers must not write through the pointers returned by the List/Get
+// accessors: those alias the map entries directly, so mutating them races with
+// every other reader.
+func (s *Store) SetVPNNodeStatus(name, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n, ok := s.vpnNodes[name]; ok {
+		n.Status = status
+		n.LastSeen = time.Now().UTC()
+	}
+}
+
 func (s *Store) SetVPNNodeHealthy(name string, healthy bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
