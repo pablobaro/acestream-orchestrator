@@ -21,7 +21,42 @@ const (
 	flushTimeoutSec     = 5.0                              // force-flush partial segment after this silence
 	defaultWindowSize   = 6                                // sliding window: keep N segments in memory
 	pcrRollover         = float64(uint64(1)<<33) / 90000.0 // ~95443 s
+
+	// maxPlausibleGapSec is the largest forward PCR step still treated as part
+	// of the open segment. Beyond it the source is on a new timeline, not in a
+	// very long segment.
+	maxPlausibleGapSec = 60.0
 )
+
+// pcrGap classifies the PCR delta between the current packet and the start of
+// the open segment.
+type pcrGap int
+
+const (
+	// pcrGapNormal is a plausible forward step within the current segment.
+	pcrGapNormal pcrGap = iota
+	// pcrGapRollover is the 33-bit PCR counter wrapping; the delta is
+	// recoverable by adding one full rollover period.
+	pcrGapRollover
+	// pcrGapDiscontinuous is a broken timeline: the source moved backwards, or
+	// forwards further than any real segment could span.
+	pcrGapDiscontinuous
+)
+
+// classifyPCRGap decides what a raw PCR delta means and returns the corrected
+// delta — for a rollover that is the wrapped value, otherwise the input.
+//
+// Split out of run() so the decision can be tested without driving a ring
+// buffer through the background goroutine.
+func classifyPCRGap(elapsed float64) (pcrGap, float64) {
+	if elapsed < -pcrRollover/2 {
+		return pcrGapRollover, elapsed + pcrRollover
+	}
+	if elapsed < 0 || elapsed > maxPlausibleGapSec {
+		return pcrGapDiscontinuous, elapsed
+	}
+	return pcrGapNormal, elapsed
+}
 
 // Segmenter slices a live MPEG-TS ring buffer into HLS segments, using PCR
 // timestamps for accurate duration measurement. No FFmpeg required.
@@ -34,8 +69,8 @@ type Segmenter struct {
 	targetDur  float64 // seconds per segment
 	windowSize int
 
-	mu                  sync.RWMutex
-	segs                []*hlsSegment
+	mu                   sync.RWMutex
+	segs                 []*hlsSegment
 	pendingDiscontinuity bool // set on buffer reset; consumed by next pushSegment
 
 	ctx    context.Context
@@ -43,10 +78,10 @@ type Segmenter struct {
 }
 
 type hlsSegment struct {
-	seq          int
-	data         []byte
-	duration     float64 // actual PCR-measured duration (or estimate)
-	discontinuity bool   // true → emit EXT-X-DISCONTINUITY before this segment
+	seq           int
+	data          []byte
+	duration      float64 // actual PCR-measured duration (or estimate)
+	discontinuity bool    // true → emit EXT-X-DISCONTINUITY before this segment
 }
 
 // NewSegmenter creates a Segmenter and starts the background slicing goroutine.
@@ -209,6 +244,11 @@ func (s *Segmenter) run() {
 							s.pushSegment(localSeq, acc, dur)
 							localSeq++
 						}
+						// The source signalled that the timeline breaks here, so the
+						// segment starting with this packet must carry the tag. Cutting
+						// without it leaves players decoding a new timeline as if it
+						// continued the old one.
+						s.markDiscontinuity()
 						// New segment begins with the discontinuity packet.
 						acc = append(acc[:0], pkt...)
 						segStart = -1
@@ -229,16 +269,24 @@ func (s *Segmenter) run() {
 					}
 
 					// Handle PCR rollover (~26.5 hour wrap) or large backwards jumps
-					elapsed := pcr - segStart
-					if elapsed < -pcrRollover/2 {
-						// Likely rollover
-						elapsed += pcrRollover
-					} else if elapsed < 0 || elapsed > 60.0 {
-						// Large jump (backwards or forwards) - force cut
+					kind, elapsed := classifyPCRGap(pcr - segStart)
+					if kind == pcrGapDiscontinuous {
 						slog.Info("large PCR jump detected, forcing cut", "stream", s.contentID, "jump", elapsed)
-						s.pushSegment(localSeq, acc, s.targetDur)
-						localSeq++
-						acc = nil
+						// The jumped packet is already in acc. Move it to the new
+						// segment so the closing one ends on the old timeline and the
+						// discontinuity tag lands on the segment that opens the new one.
+						acc = acc[:len(acc)-ts.PacketSize]
+						if len(acc) >= ts.PacketSize {
+							s.pushSegment(localSeq, acc, s.targetDur)
+							localSeq++
+						}
+						// A PCR that moves backwards — or forwards further than any
+						// real segment could span — is a new timeline. Without the tag
+						// players see time travel inside a continuous playlist and
+						// either stall waiting for a timestamp that never comes or
+						// rewind to the older one.
+						s.markDiscontinuity()
+						acc = append(acc[:0], pkt...)
 						segStart = pcr
 						continue
 					}
@@ -277,9 +325,7 @@ func (s *Segmenter) run() {
 					cursor = -1
 				}
 				cursorGen = gen
-				s.mu.Lock()
-				s.pendingDiscontinuity = true
-				s.mu.Unlock()
+				s.markDiscontinuity()
 				resetFlush()
 				continue
 			}
@@ -309,6 +355,14 @@ func (s *Segmenter) run() {
 			}
 		}
 	}
+}
+
+// markDiscontinuity flags the next segment as opening a new timeline, so the
+// manifest emits EXT-X-DISCONTINUITY before it.
+func (s *Segmenter) markDiscontinuity() {
+	s.mu.Lock()
+	s.pendingDiscontinuity = true
+	s.mu.Unlock()
 }
 
 func (s *Segmenter) pushSegment(seq int, data []byte, dur float64) {

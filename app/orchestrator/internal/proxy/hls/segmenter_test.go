@@ -1,8 +1,13 @@
 package hls
 
 import (
+	"context"
+	"math"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/acestream/acestream/internal/proxy/buffer"
 )
 
 // newTestSegmenter builds a Segmenter with a nil buffer — safe for tests that
@@ -192,5 +197,108 @@ func TestSegmenter_DiscontinuityConsumedOnce(t *testing.T) {
 	_ = seg1
 	if disc1 {
 		t.Error("second segment after discontinuity must not carry discontinuity flag")
+	}
+}
+
+// ── PCR gap classification ────────────────────────────────────────────────────
+
+func TestClassifyPCRGap(t *testing.T) {
+	tests := []struct {
+		name     string
+		elapsed  float64
+		wantKind pcrGap
+		wantSec  float64
+	}{
+		{"steady forward step", 1.5, pcrGapNormal, 1.5},
+		{"zero step", 0, pcrGapNormal, 0},
+		{"at the plausible limit", maxPlausibleGapSec, pcrGapNormal, maxPlausibleGapSec},
+		{"just past the limit", maxPlausibleGapSec + 0.1, pcrGapDiscontinuous, maxPlausibleGapSec + 0.1},
+		{"backwards jump", -90, pcrGapDiscontinuous, -90},
+		{"counter rollover", -pcrRollover + 3, pcrGapRollover, 3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, sec := classifyPCRGap(tc.elapsed)
+			if kind != tc.wantKind {
+				t.Errorf("kind = %v, want %v", kind, tc.wantKind)
+			}
+			if math.Abs(sec-tc.wantSec) > 1e-6 {
+				t.Errorf("corrected elapsed = %v, want %v", sec, tc.wantSec)
+			}
+		})
+	}
+}
+
+// ── Backwards PCR produces a tagged discontinuity ─────────────────────────────
+
+// pcrPacket builds a minimal 188-byte TS packet carrying a PCR at the given
+// time in seconds (90 kHz base, zero extension).
+func pcrPacket(seconds float64) []byte {
+	base := int64(seconds * 90000)
+	pkt := make([]byte, 188)
+	pkt[0] = 0x47
+	pkt[1] = 0x01 // PID 0x100
+	pkt[2] = 0x00
+	pkt[3] = 0x30 // adaptation + payload
+	pkt[4] = 7    // adaptation field length
+	pkt[5] = 0x10 // PCR_flag
+	pkt[6] = byte(base >> 25)
+	pkt[7] = byte(base >> 17)
+	pkt[8] = byte(base >> 9)
+	pkt[9] = byte(base >> 1)
+	pkt[10] = byte((base&1)<<7) | 0x7E
+	pkt[11] = 0
+	return pkt
+}
+
+// TestSegmenter_BackwardsPCR_TagsDiscontinuity drives the real run() loop
+// through a ring buffer whose PCR jumps backwards — the AceStream failure mode
+// where a reconnect replays the engine's buffer from behind the live edge.
+//
+// Without the tag, players see the timeline move backwards inside a playlist
+// they believe is continuous, and either stall or rewind.
+func TestSegmenter_BackwardsPCR_TagsDiscontinuity(t *testing.T) {
+	buf := buffer.New(188*2, 4)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s := &Segmenter{
+		contentID:  "test-stream",
+		buf:        buf,
+		targetDur:  defaultTargetDurSec,
+		windowSize: 6,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+	go s.run()
+
+	// Let run() anchor its cursor to the (empty) live edge before writing.
+	time.Sleep(50 * time.Millisecond)
+
+	var stream []byte
+	stream = append(stream, pcrPacket(100)...) // opens the segment at t=100s
+	stream = append(stream, pcrPacket(10)...)  // timeline jumps backwards
+	stream = append(stream, pcrPacket(16)...)  // +6s forces the next cut
+	stream = append(stream, makeTS(3)...)      // padding so every chunk flushes
+	buf.Write(stream)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.SegmentCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := s.SegmentCount(); n < 2 {
+		t.Fatalf("expected at least 2 segments after the backwards jump, got %d", n)
+	}
+
+	s.mu.RLock()
+	second := s.segs[1]
+	s.mu.RUnlock()
+	if !second.discontinuity {
+		t.Error("the segment opening the new timeline must carry the discontinuity flag")
+	}
+
+	if m := s.Manifest("http://localhost", "s"); !strings.Contains(m, "#EXT-X-DISCONTINUITY") {
+		t.Errorf("manifest must tag the backwards PCR jump, got:\n%s", m)
 	}
 }
