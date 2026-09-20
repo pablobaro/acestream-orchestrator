@@ -287,6 +287,9 @@ func (p *Provisioner) startContainer(
 	}
 	defer cli.Close()
 
+	dockerNet := config.C.Load().DockerNetwork
+	applyFirewallSubnetAllowlist(ctx, cli, dockerNet, envMap)
+
 	envList := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envList = append(envList, k+"="+v)
@@ -311,7 +314,6 @@ func (p *Provisioner) startContainer(
 	}
 
 	netCfg := &network.NetworkingConfig{}
-	dockerNet := config.C.Load().DockerNetwork
 	if dockerNet != "" {
 		hostCfg.NetworkMode = container.NetworkMode(dockerNet)
 		if dockerNet != "host" && dockerNet != "none" {
