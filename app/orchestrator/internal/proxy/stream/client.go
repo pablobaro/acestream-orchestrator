@@ -91,12 +91,31 @@ func (cs *ClientStreamer) Stream(ctx context.Context) {
 	cfg := config.C.Load()
 	maxEmpty := cfg.NoDataTimeoutChecks
 	emptyCount := 0
+	gen := cs.buf.Generation()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+
+		// The ring is cleared on an engine hot-swap or an upstream reconnect,
+		// and its generation counter is the only signal that it happened. Our
+		// cursor then points at slots that were emptied, so WriteAfterTo finds
+		// nothing and keeps finding nothing until head has advanced a full ring
+		// past us — the client freezes for a whole buffer's worth of stream.
+		// Re-anchoring to the live edge turns that freeze into a clean jump.
+		if g := cs.buf.Generation(); g != gen {
+			gen = g
+			head := cs.buf.Head()
+			if head < 0 {
+				head = 0
+			}
+			slog.Info("client re-anchoring after buffer reset", "stream", cs.contentID,
+				"client", cs.clientID, "old_index", cs.localIndex, "new_index", head)
+			cs.localIndex = head
+			emptyCount = 0
 		}
 
 		n, newIdx, err := cs.buf.WriteAfterTo(cs.localIndex, 15, cs.w)

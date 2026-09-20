@@ -117,6 +117,14 @@ func (r *Reader) Start(ctx context.Context) error {
 			if everHadData {
 				slog.Warn("upstream stall (P2P gap), reconnecting", "stream", r.contentID,
 					"attempt", attempt, "err", err)
+				// Reconnecting issues a fresh GET, and the engine restarts
+				// delivery from wherever its own buffer begins — behind the live
+				// edge. Appending that to the ring splices already-played time
+				// onto the end of the stream. Resetting bumps the ring's
+				// generation, which is how the segmenter and the TS clients learn
+				// to re-anchor and flag the break instead of serving the past as
+				// if it were new.
+				r.buf.Reset()
 			} else {
 				slog.Warn("upstream connect/read error", "stream", r.contentID,
 					"attempt", attempt, "err", err)
