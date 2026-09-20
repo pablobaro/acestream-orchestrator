@@ -3,10 +3,13 @@ package vpn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -65,115 +68,196 @@ func evictPortCache(vpnContainer string) {
 	delete(portCache, vpnContainer)
 }
 
-// ── API helpers ───────────────────────────────────────────────────────────────
+// ── Control-API probing ───────────────────────────────────────────────────────
 
-// IsControlAPIReachable checks whether the Gluetun control API is up and
-// (optionally) reports connected=true.
+// Probe outcome classifications. These are stable, machine-readable values: a
+// dial timeout, a refused connection and a reachable-but-disconnected tunnel
+// each point at a completely different fix, so the health log has to say which
+// one happened instead of just "healthy=false".
+const (
+	ReasonOK                 = "ok"
+	ReasonDNSFailure         = "dns_failure"
+	ReasonConnectionRefused  = "connection_refused"
+	ReasonTimeout            = "timeout"
+	ReasonNetworkUnreachable = "network_unreachable"
+	ReasonTransportError     = "transport_error"
+	ReasonServerError        = "server_error"
+	ReasonTunnelDown         = "tunnel_down"
+)
+
+// ControlAPIProbe is the outcome of probing a Gluetun control API, including
+// why it failed.
+type ControlAPIProbe struct {
+	// Reachable is true when the control server answered at all.
+	Reachable bool
+	// Connected is true when the VPN tunnel is provably carrying traffic.
+	Connected bool
+	// Reason classifies the outcome (one of the Reason* constants).
+	Reason string
+	// Detail carries the raw error or status text, for logs.
+	Detail string
+}
+
+// probeClient is a dedicated HTTP client for control-API probes.
+//
+// It deliberately does not use http.DefaultClient. Probes run on a timer
+// against containers whose network stack is reconfigured underneath us:
+// Gluetun re-applies its firewall rules on every VPN (re)connection, which
+// drops existing conntrack entries. A pooled keep-alive connection survives
+// that as a half-open socket on our side, so the shared transport keeps handing
+// the same dead connection back and every subsequent probe times out until the
+// orchestrator restarts. OpenVPN renegotiates and reconnects far more often
+// than WireGuard, which is why that failure mode shows up asymmetrically.
+//
+// One TCP handshake per probe is a cheap price for probes that are actually
+// independent of each other.
+var probeClient = &http.Client{
+	Transport: &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: (&net.Dialer{
+			Timeout: 2 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   2 * time.Second,
+		ResponseHeaderTimeout: 3 * time.Second,
+	},
+}
+
+// probeURL joins a control-API base URL with a path without doubling slashes.
+func probeURL(base, path string) string {
+	return strings.TrimRight(base, "/") + path
+}
+
+// classifyTransportError maps a transport-level error to a Reason* constant.
+// It returns "" for a nil error.
+func classifyTransportError(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return ReasonDNSFailure
+	}
+	if isConnRefused(err) {
+		return ReasonConnectionRefused
+	}
+	if isNetUnreachable(err) {
+		return ReasonNetworkUnreachable
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return ReasonTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ReasonTimeout
+	}
+	return ReasonTransportError
+}
+
+// IsControlAPIReachable reports whether the Gluetun control API is up and
+// (optionally) connected. Callers that need to know *why* a probe failed should
+// use ProbeControlAPI instead.
+func IsControlAPIReachable(vpnContainer string, requireConnected bool) bool {
+	p := ProbeControlAPI(vpnContainer, requireConnected)
+	if requireConnected {
+		return p.Connected
+	}
+	return p.Reachable
+}
+
+// ProbeControlAPI probes a VPN container's Gluetun control API and reports the
+// full outcome.
 //
 // Connectivity detection strategy:
-//  1. GET /v1/publicip/ip — if it returns a non-empty public_ip, the VPN tunnel
-//     is provably up (this endpoint is always auth-free in Gluetun).
-//  2. Fallback to /v1/openvpn/status or /v1/wireguard/status. A 401 on these
-//     endpoints means the API server is up and auth is configured on the
-//     endpoint (e.g. via a persistent auth/config.toml in the Gluetun volume);
-//     the tunnel is considered connected in that case too.
-func IsControlAPIReachable(vpnContainer string, requireConnected bool) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+//  1. GET /v1/publicip/ip — a non-empty public_ip proves the tunnel is carrying
+//     traffic (this endpoint is always auth-free in Gluetun).
+//  2. Fallback to /v1/openvpn/status, then /v1/wireguard/status. A 401 on those
+//     means the API server is up and auth is configured on the endpoint (e.g.
+//     via a persistent auth/config.toml in the Gluetun volume); the tunnel is
+//     considered connected in that case too.
+func ProbeControlAPI(vpnContainer string, requireConnected bool) ControlAPIProbe {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
+	return probeControlAPIAt(ctx, controlAPIURL(vpnContainer), requireConnected)
+}
 
-	url := controlAPIURL(vpnContainer) + "/v1/publicip/ip"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func probeControlAPIAt(ctx context.Context, base string, requireConnected bool) ControlAPIProbe {
+	status, body, err := probeGet(ctx, probeURL(base, "/v1/publicip/ip"))
 	if err != nil {
-		return false
+		return ControlAPIProbe{Reason: classifyTransportError(err), Detail: err.Error()}
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		return false
+	if status >= 500 {
+		return ControlAPIProbe{
+			Reason: ReasonServerError,
+			Detail: fmt.Sprintf("GET /v1/publicip/ip returned %d", status),
+		}
 	}
 
 	if !requireConnected {
-		return true
+		return ControlAPIProbe{Reachable: true, Reason: ReasonOK}
 	}
 
-	// Primary connectivity signal: parse the public IP from the response body.
-	// A non-empty public_ip means the VPN tunnel is carrying internet traffic.
-	// This endpoint is always auth-free in Gluetun regardless of auth config.
-	body, _ := io.ReadAll(resp.Body)
+	// Primary connectivity signal: a non-empty public IP.
 	var ipResp struct {
 		IP string `json:"public_ip"`
 	}
 	if err := json.Unmarshal(body, &ipResp); err == nil && ipResp.IP != "" {
-		return true
+		return ControlAPIProbe{Reachable: true, Connected: true, Reason: ReasonOK}
 	}
 
-	// Fallback: try OpenVPN status.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel2()
-
-	statusURL := controlAPIURL(vpnContainer) + "/v1/openvpn/status"
-	req2, err := http.NewRequestWithContext(ctx2, http.MethodGet, statusURL, nil)
-	if err != nil {
-		return isWireguardConnected(vpnContainer)
-	}
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		return isWireguardConnected(vpnContainer)
-	}
-	defer resp2.Body.Close()
-
-	// 401 = auth required = server is up = treat as connected.
-	if resp2.StatusCode == http.StatusUnauthorized {
-		return true
+	// Fallbacks: the per-protocol status endpoints.
+	observed := make([]string, 0, 2)
+	for _, path := range []string{"/v1/openvpn/status", "/v1/wireguard/status"} {
+		connected, statusText := probeTunnelStatus(ctx, base, path)
+		if connected {
+			return ControlAPIProbe{Reachable: true, Connected: true, Reason: ReasonOK}
+		}
+		observed = append(observed, path+"="+statusText)
 	}
 
-	body2, _ := io.ReadAll(resp2.Body)
-	var statusResp struct {
-		Status string `json:"status"`
+	return ControlAPIProbe{
+		Reachable: true,
+		Reason:    ReasonTunnelDown,
+		Detail:    "control API up, no tunnel reported established (" + strings.Join(observed, ", ") + ")",
 	}
-	if err := json.Unmarshal(body2, &statusResp); err != nil {
-		return isWireguardConnected(vpnContainer)
-	}
-	if strings.ToLower(statusResp.Status) == "running" {
-		return true
-	}
-	// OpenVPN returned but reported not-running — try WireGuard before giving up.
-	return isWireguardConnected(vpnContainer)
 }
 
-func isWireguardConnected(vpnContainer string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	url := controlAPIURL(vpnContainer) + "/v1/wireguard/status"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// probeTunnelStatus queries one of Gluetun's per-protocol status endpoints.
+// statusText is always a short, log-friendly description of what happened.
+func probeTunnelStatus(ctx context.Context, base, path string) (connected bool, statusText string) {
+	status, body, err := probeGet(ctx, probeURL(base, path))
 	if err != nil {
-		return false
+		return false, classifyTransportError(err)
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
 	// 401 = auth required = server is up = treat as connected.
-	if resp.StatusCode == http.StatusUnauthorized {
-		return true
+	if status == http.StatusUnauthorized {
+		return true, "unauthorized"
 	}
-
-	body, _ := io.ReadAll(resp.Body)
 	var s struct {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(body, &s); err != nil {
-		return false
+		return false, fmt.Sprintf("http_%d_unparseable", status)
 	}
-	return strings.ToLower(s.Status) == "running"
+	if s.Status == "" {
+		return false, fmt.Sprintf("http_%d_no_status", status)
+	}
+	return strings.EqualFold(s.Status, "running"), s.Status
+}
+
+func probeGet(ctx context.Context, url string) (status int, body []byte, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ = io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, body, nil
 }
 
 // GetForwardedPort fetches the current forwarded port from the Gluetun control
@@ -195,23 +279,16 @@ func GetForwardedPort(vpnContainer string) int {
 }
 
 func fetchPort(ctx context.Context, vpnContainer, path string) int {
-	url := controlAPIURL(vpnContainer) + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	status, body, err := probeGet(ctx, probeURL(controlAPIURL(vpnContainer), path))
 	if err != nil {
+		slog.Debug("forwarded-port fetch failed",
+			"vpn", vpnContainer, "reason", classifyTransportError(err), "err", err)
+		return 0
+	}
+	if status != http.StatusOK {
 		return 0
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0
-	}
-
-	body, _ := io.ReadAll(resp.Body)
 	var portResp struct {
 		Port int `json:"port"`
 	}
