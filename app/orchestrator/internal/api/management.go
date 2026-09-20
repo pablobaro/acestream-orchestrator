@@ -21,6 +21,7 @@ import (
 	"github.com/acestream/acestream/internal/config"
 	cpdocker "github.com/acestream/acestream/internal/controlplane/docker"
 	cpengine "github.com/acestream/acestream/internal/controlplane/engine"
+	"github.com/acestream/acestream/internal/proxy/stream"
 	"github.com/acestream/acestream/internal/proxy/telemetry"
 	"github.com/acestream/acestream/internal/state"
 )
@@ -53,6 +54,11 @@ func (s *ProxyServer) registerManagementRoutes() {
 	s.mux.HandleFunc("GET /api/v1/streams/{id}/stats", s.mgHandleStreamStats)
 	s.mux.HandleFunc("GET /api/v1/streams/{id}/extended-stats", s.mgHandleStreamExtendedStats)
 	s.mux.HandleFunc("GET /api/v1/streams/{id}/livepos", s.mgHandleStreamLivepos)
+
+	// ── Looping streams ───────────────────────────────────────────────────────
+	s.mux.HandleFunc("GET /api/v1/looping-streams", s.mgHandleListLoopingStreams)
+	s.mux.HandleFunc("DELETE /api/v1/looping-streams/{id}", s.requireAPIKey(s.mgHandleUnmarkLoopingStream))
+	s.mux.HandleFunc("POST /api/v1/looping-streams/clear", s.requireAPIKey(s.mgHandleClearLoopingStreams))
 
 	// ── Provisioning ──────────────────────────────────────────────────────────
 	s.mux.HandleFunc("POST /api/v1/provision", s.requireAPIKey(s.mgHandleProvision))
@@ -2773,3 +2779,48 @@ func (ls *lineScanner) Scan() bool {
 }
 
 func (ls *lineScanner) Text() string { return ls.line }
+
+// ── Looping streams ───────────────────────────────────────────────────────────
+
+// mgHandleListLoopingStreams reports the streams detected as replaying old data
+// instead of following the live edge. See docs/STREAM_LOOP_DETECTION.md.
+func (s *ProxyServer) mgHandleListLoopingStreams(w http.ResponseWriter, r *http.Request) {
+	cfg := config.C.Load()
+	ids, marks := stream.Loops.List(time.Now(), cfg.StreamLoopRetention)
+
+	detected := make(map[string]string, len(marks))
+	for id, at := range marks {
+		detected[id] = at.UTC().Format(time.RFC3339)
+	}
+
+	mgWriteJSON(w, http.StatusOK, map[string]any{
+		"stream_ids":        ids,
+		"streams":           detected,
+		"retention_minutes": int(cfg.StreamLoopRetention.Minutes()),
+		"enabled":           cfg.StreamLoopDetectionEnabled,
+		"threshold_seconds": int(cfg.StreamLoopThreshold.Seconds()),
+	})
+}
+
+// mgHandleUnmarkLoopingStream clears one stream's mark so it can be played
+// again — the manual override for a source that has started broadcasting.
+func (s *ProxyServer) mgHandleUnmarkLoopingStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !stream.Loops.Remove(id) {
+		mgWriteJSON(w, http.StatusNotFound, map[string]string{"error": "stream not marked as looping"})
+		return
+	}
+	slog.Info("stream unmarked as looping", "stream", id)
+	mgWriteJSON(w, http.StatusOK, map[string]string{
+		"message": "Stream " + id + " removed from looping list",
+	})
+}
+
+func (s *ProxyServer) mgHandleClearLoopingStreams(w http.ResponseWriter, r *http.Request) {
+	n := stream.Loops.Clear()
+	slog.Info("looping stream list cleared", "removed", n)
+	mgWriteJSON(w, http.StatusOK, map[string]any{
+		"message": "All looping streams cleared",
+		"removed": n,
+	})
+}

@@ -518,8 +518,55 @@ func (m *Manager) statsPusher(ctx context.Context) {
 			return
 		case fs := <-m.pushStatsCh:
 			m.buildAndAppendStat(fs)
+			m.checkLiveLag(fs)
 		}
 	}
+}
+
+// checkLiveLag stops a stream whose engine has stopped tracking the live edge.
+//
+// The engine does not report an error in this state — it keeps serving the data
+// it already holds, so playback continues on a loop of old content. Letting it
+// run means viewers watch the past with no indication anything is wrong.
+func (m *Manager) checkLiveLag(fs *aceapi.FullStatus) {
+	cfg := config.C.Load()
+	if !cfg.StreamLoopDetectionEnabled || fs == nil || fs.LivePos == nil {
+		return
+	}
+	// Only a live stream has a live edge to fall behind.
+	if fs.LivePos.IsLive == 0 {
+		return
+	}
+
+	now := time.Now()
+	if !isLiveLagExceeded(fs.LivePos.LastTS, now, cfg.StreamLoopThreshold) {
+		return
+	}
+
+	contentID := m.params.ContentID
+	if Loops.IsLooping(contentID, now, cfg.StreamLoopRetention) {
+		return // already detected; the stop is in flight
+	}
+
+	lag := now.Sub(time.Unix(fs.LivePos.LastTS, 0)).Round(time.Second)
+	slog.Warn("stream is looping: engine stopped tracking the live edge",
+		"stream", contentID, "live_last_lag", lag, "threshold", cfg.StreamLoopThreshold)
+
+	Loops.Mark(contentID, now)
+	state.RecordEvent(state.EventEntry{
+		EventType: "stream",
+		Category:  "looping",
+		Message:   "Stream stopped: engine is replaying old data instead of the live edge",
+		Details: map[string]any{
+			"stream":        contentID,
+			"live_last_lag": lag.String(),
+			"threshold":     cfg.StreamLoopThreshold.String(),
+		},
+	})
+
+	// StopStream cancels the context this loop runs under, so it cannot be
+	// called inline without deadlocking the shutdown against itself.
+	go m.hub.StopStream(contentID)
 }
 
 func (m *Manager) buildAndAppendStat(fs *aceapi.FullStatus) {

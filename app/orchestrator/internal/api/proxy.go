@@ -152,6 +152,9 @@ func (s *ProxyServer) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	var prebufferSeconds int
 
 	if mgr == nil {
+		if s.rejectIfLooping(w, streamKey) {
+			return
+		}
 		s.st.OnStreamAllocating(streamKey, "TS", config.C.Load().ControlMode)
 		ep, err := s.selectEngineWithWait(r.Context())
 		if err != nil {
@@ -309,6 +312,9 @@ func (s *ProxyServer) handleHLSManifestAPIMode(
 	streamKey string, mgr *stream.Manager, buf *buffer.RingBuffer,
 ) {
 	if mgr == nil {
+		if s.rejectIfLooping(w, streamKey) {
+			return
+		}
 		s.st.OnStreamAllocating(streamKey, "HLS", config.C.Load().ControlMode)
 		ep, err := s.selectEngineWithWait(r.Context())
 		if err != nil {
@@ -795,3 +801,26 @@ func isUnreserved(b byte) bool {
 }
 
 var _ = decodeJSON // suppress unused warning if not called
+
+// ── Looping-stream gate ───────────────────────────────────────────────────────
+
+// rejectIfLooping refuses to start a stream the loop detector has flagged, and
+// reports whether it did.
+//
+// Detection alone would achieve nothing here: stopping a looping stream frees
+// the engine, and the next client request allocates another one and drops the
+// viewer straight back into the same loop. The mark is what breaks that cycle
+// until the source is broadcasting again — clear it via
+// DELETE /api/v1/looping-streams/{id}.
+func (s *ProxyServer) rejectIfLooping(w http.ResponseWriter, streamKey string) bool {
+	cfg := config.C.Load()
+	if !cfg.StreamLoopDetectionEnabled {
+		return false
+	}
+	if !stream.Loops.IsLooping(streamKey, time.Now(), cfg.StreamLoopRetention) {
+		return false
+	}
+	slog.Info("refusing stream marked as looping", "stream", streamKey)
+	http.Error(w, "stream not available: source is looping", http.StatusServiceUnavailable)
+	return true
+}

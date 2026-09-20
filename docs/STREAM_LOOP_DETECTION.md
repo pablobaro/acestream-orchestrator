@@ -1,227 +1,115 @@
-# Stream Loop Detection and Looping Streams Tracker
+# Stream Loop Detection
 
-This document describes the stream loop detection feature and the looping streams tracker that prevents playback of detected looping streams.
+Detects live streams whose engine has stopped following the broadcast and is
+replaying data it already holds, then stops them and refuses to restart them
+until the source recovers.
 
-## Overview
+## Why it exists
 
-The orchestrator includes a stream loop detection system that automatically identifies and stops streams that are looping (not receiving new data from the broadcast). When a looping stream is detected, its AceStream ID is added to a tracker that can be queried by the Proxy proxy to prevent playback attempts.
+A live AceStream engine reports `live_last`: the wall-clock timestamp of the
+newest data it holds. When the broadcast stops feeding it, the engine does not
+fail. It keeps serving what it already has, so playback continues — on old
+content, with no error anywhere. Viewers see a channel that is stuck and
+running backwards in time.
 
-## Components
+Nothing else catches this. The engine is healthy, the tunnel is up, bytes are
+flowing, and the proxy is happily forwarding them. Only `live_last` says the
+stream left the present behind.
 
-### 1. Stream Loop Detector (`app/services/stream_loop_detector.py`)
+## Configuration
 
-Periodically monitors active live streams by checking their `live_last` timestamp from the AceStream engine's stat URL. If a stream falls too far behind the current time, it's considered looping and automatically stopped.
+| Variable | Default | Meaning |
+|---|---|---|
+| `STREAM_LOOP_DETECTION_ENABLED` | `false` | Enable detection. Off by default: a badly chosen threshold takes working channels off the air. |
+| `STREAM_LOOP_DETECTION_THRESHOLD_S` | `3600` | How far `live_last` may fall behind now before the stream counts as looping. |
+| `STREAM_LOOP_RETENTION_MINUTES` | `0` | How long a detected stream stays blocked. `0` keeps it until cleared by hand. |
 
-**Configuration:**
-- `STREAM_LOOP_DETECTION_ENABLED`: Enable/disable loop detection (default: `false`)
-- `STREAM_LOOP_DETECTION_THRESHOLD_S`: Time threshold in seconds (default: `3600` = 1 hour)
-- `STREAM_LOOP_CHECK_INTERVAL_S`: How often to check streams (default: `10` seconds)
+There is no separate check interval: the check runs on the existing per-stream
+stat tick, so detection costs nothing extra and needs no tuning.
 
-### 2. Looping Streams Tracker (`app/services/looping_streams.py`)
+### Choosing a threshold
 
-Maintains a list of AceStream content IDs that have been detected as looping. Supports configurable retention time for automatic cleanup.
+- Live sport or events: 30–60 minutes, to take a stale feed off the air quickly.
+- General streaming: 1–2 hours, to avoid blocking a channel over a rough patch.
 
-**Configuration:**
-- `STREAM_LOOP_RETENTION_MINUTES`: How long to keep looping stream IDs
-  - `0` or unset: Indefinite retention (manual removal required)
-  - `> 0`: Automatic removal after specified minutes
+Too low and a channel that recovers on its own gets blocked anyway. The
+threshold is the only guard against that, so start high and tighten it.
 
-### 3. Proxy Proxy Integration (`context/proxy/proxy/`)
+## Behaviour
 
-The Proxy proxy checks the looping streams list before selecting an engine. If a stream ID is marked as looping, Proxy returns a "stream not available" error to the player.
+1. Every stat tick, a live stream's `live_last` is compared against the clock.
+2. Past the threshold, the stream is marked, an event is recorded, and the
+   stream is stopped.
+3. While it is marked, requests for it are refused with
+   `503 Service Unavailable` before any engine is allocated.
 
-**Changes:**
-- `SelectBestEngine()` now accepts `aceID` parameter
-- New `IsStreamLooping()` method checks the `/looping-streams` endpoint
-- Returns structured error with `stream_looping` code when detected
+Step 3 is the point of the mark. Stopping alone achieves nothing: the next
+client request would allocate another engine and drop the viewer straight back
+into the same loop.
 
-## API Endpoints
+Streams reporting `is_live=0` are never checked — VOD has no live edge to fall
+behind.
 
-### GET `/looping-streams`
+## API
 
-Returns list of streams currently marked as looping.
+### `GET /api/v1/looping-streams`
 
-**Response:**
 ```json
 {
   "stream_ids": ["content_id_1", "content_id_2"],
   "streams": {
-    "content_id_1": "2024-01-08T12:00:00Z",
-    "content_id_2": "2024-01-08T12:05:00Z"
+    "content_id_1": "2026-01-08T12:00:00Z",
+    "content_id_2": "2026-01-08T12:05:00Z"
   },
-  "retention_minutes": 0
-}
-```
-
-### DELETE `/looping-streams/{stream_id}`
-
-Manually remove a stream from the looping list. Requires API key.
-
-**Response:**
-```json
-{
-  "message": "Stream content_id_1 removed from looping list"
-}
-```
-
-### POST `/looping-streams/clear`
-
-Clear all looping streams. Requires API key.
-
-**Response:**
-```json
-{
-  "message": "All looping streams cleared"
-}
-```
-
-### GET `/stream-loop-detection/config`
-
-Get current loop detection configuration.
-
-**Response:**
-```json
-{
+  "retention_minutes": 0,
   "enabled": true,
-  "threshold_seconds": 3600,
-  "threshold_minutes": 60,
-  "threshold_hours": 1,
-  "check_interval_seconds": 10,
-  "retention_minutes": 0
+  "threshold_seconds": 3600
 }
 ```
 
-### POST `/stream-loop-detection/config`
+### `DELETE /api/v1/looping-streams/{id}`
 
-Update loop detection configuration. Requires API key.
+Clears one mark so the stream can be played again. Requires an API key.
+Returns `404` if the stream was not marked.
 
-**Parameters:**
-- `enabled` (boolean): Enable/disable loop detection
-- `threshold_seconds` (integer): Detection threshold (minimum: 60)
-- `check_interval_seconds` (integer, optional): Check frequency (minimum: 5)
-- `retention_minutes` (integer, optional): Retention time (0 = indefinite)
+### `POST /api/v1/looping-streams/clear`
 
-**Response:**
-```json
-{
-  "message": "Stream loop detection configuration updated",
-  "enabled": true,
-  "threshold_seconds": 3600,
-  "threshold_minutes": 60,
-  "threshold_hours": 1,
-  "check_interval_seconds": 10,
-  "retention_minutes": 0
-}
-```
-
-## UI Configuration
-
-The orchestrator panel provides a Settings page with loop detection configuration:
-
-1. **Enable Loop Detection**: Toggle to enable/disable the feature
-2. **Threshold**: Time in minutes before a stream is considered looping
-3. **Check Interval**: How often to check streams (in seconds)
-4. **Retention Time**: How long to keep looping stream IDs (0 = indefinite)
-5. **Looping Streams List**: View and manage currently blocked streams
-
-## Usage Examples
-
-### Enable Loop Detection with 2-hour threshold
+Clears every mark. Requires an API key.
 
 ```bash
-curl -X POST "http://orchestrator:8000/stream-loop-detection/config?enabled=true&threshold_seconds=7200&check_interval_seconds=15&retention_minutes=120" \
-  -H "Authorization: Bearer YOUR_API_KEY"
+curl "http://orchestrator:8000/api/v1/looping-streams"
+
+curl -X DELETE "http://orchestrator:8000/api/v1/looping-streams/STREAM_ID" \
+  -H "X-API-KEY: $API_KEY"
 ```
 
-### Check if a stream is looping
+## Implementation
 
-```bash
-curl "http://orchestrator:8000/looping-streams"
-```
+- `internal/proxy/stream/loopdetect.go` — the lag test and the tracker.
+- `internal/proxy/stream/manager.go` — `checkLiveLag`, run from the stat loop.
+- `internal/api/proxy.go` — `rejectIfLooping`, the gate ahead of engine selection.
+- `internal/api/management.go` — the three endpoints above.
 
-### Manually remove a looping stream
-
-```bash
-curl -X DELETE "http://orchestrator:8000/looping-streams/STREAM_ID" \
-  -H "Authorization: Bearer YOUR_API_KEY"
-```
-
-## Behavior
-
-### Loop Detection Process
-
-1. Stream loop detector checks active live streams every `STREAM_LOOP_CHECK_INTERVAL_S` seconds
-2. For each stream, it queries the engine's stat URL to get `live_last` timestamp
-3. If `current_time - live_last > STREAM_LOOP_DETECTION_THRESHOLD_S`:
-   - Stream is stopped via command URL
-   - Stream's content ID is added to looping streams tracker
-   - Event is logged to orchestrator event log
-
-### Proxy Proxy Behavior
-
-1. When a client requests a stream via `/ace/getstream?id=CONTENT_ID`
-2. Proxy calls orchestrator's `/looping-streams` endpoint
-3. If the content ID is in the list:
-   - Returns 503 Service Unavailable
-   - Error code: `stream_looping`
-   - Message: "This stream has been detected as looping (no new data). Playback is not available."
-   - Video player sees this as stream unavailable/error
-
-### Retention and Cleanup
-
-- If `STREAM_LOOP_RETENTION_MINUTES = 0`: Streams remain indefinitely until manually removed
-- If `STREAM_LOOP_RETENTION_MINUTES > 0`: Background task removes entries older than configured time
-- Cleanup runs every 60 seconds
-
-## Best Practices
-
-1. **Threshold Configuration**: Set based on your use case
-   - Live sports/events: 30-60 minutes (detect stale feeds quickly)
-   - General streaming: 1-2 hours (avoid false positives)
-
-2. **Retention Strategy**:
-   - Indefinite retention (0): For manual curation
-   - Time-limited retention: For automatic recovery (e.g., 24 hours)
-
-3. **Check Interval**:
-   - Lower values (5-10s): Faster detection, higher CPU usage
-   - Higher values (30-60s): Lower CPU usage, slower detection
-
-4. **Monitoring**:
-   - Check orchestrator event logs for loop detection events
-   - Monitor looping streams list via UI or API
-   - Use retention to automatically clear recovered streams
+`live_last` reaches these from `internal/proxy/aceapi`, which parses the
+engine's `livepos` event.
 
 ## Troubleshooting
 
-### Stream marked as looping but is actually live
+**A live channel got marked.** Clear it with the DELETE endpoint and raise the
+threshold. Check the recorded event for the measured lag — that number tells
+you how far off the threshold was.
 
-- Manually remove from looping list via UI or API
-- Check if `live_last` timestamp is updating correctly
-- Verify stream is actually receiving new data
-- Consider increasing detection threshold
+**Nothing is ever detected.** Confirm `STREAM_LOOP_DETECTION_ENABLED=true`, that
+the stream reports `is_live=1`, and that `live_last` is present in
+`GET /api/v1/streams/{id}/livepos`. An engine that never reports a live position
+is never checked.
 
-### Loop detection not triggering
+**A channel stays blocked after the source comes back.** With
+`STREAM_LOOP_RETENTION_MINUTES=0` that is the configured behaviour. Clear it by
+hand, or set a retention window so marks expire on their own.
 
-- Verify `STREAM_LOOP_DETECTION_ENABLED=true`
-- Check that streams are marked as `is_live=true`
-- Ensure stat URLs are accessible
-- Review orchestrator logs for errors
+## Not implemented
 
-### Proxy not blocking looping streams
-
-- Verify Proxy can reach orchestrator's `/looping-streams` endpoint
-- Check network connectivity and firewall rules
-- Review Proxy logs for looping stream checks
-- Ensure stream ID format matches (content_id vs infohash)
-
-## Migration Notes
-
-This feature is backwards compatible. Existing installations will have loop detection disabled by default. To enable:
-
-1. Set `STREAM_LOOP_DETECTION_ENABLED=true` in `.env`
-2. Configure threshold and check interval as needed
-3. Restart orchestrator
-4. Configure retention time via UI or API
-
-No Proxy changes are required - the proxy gracefully handles missing `/looping-streams` endpoint (fails open).
+Configuration is read from the environment at startup. There is no endpoint or
+panel page for changing these values at runtime — an earlier revision of this
+document described one that does not exist.

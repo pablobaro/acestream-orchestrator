@@ -93,6 +93,11 @@ type Config struct {
 	HLSMaxInitialSegments   int
 	HLSSegmentFetchInterval float64
 
+	// ── Proxy: looping-stream detection ──────────────────────────────────────
+	StreamLoopDetectionEnabled bool
+	StreamLoopThreshold        time.Duration
+	StreamLoopRetention        time.Duration
+
 	// ── Proxy: limits ────────────────────────────────────────────────────────
 	MaxClientsPerStreamCount int
 	MaxTotalStreams          int
@@ -516,6 +521,11 @@ func load() *Config {
 		HLSInitialBufferSeconds: envInt("HLS_INITIAL_BUFFER_SECONDS", 10),
 		HLSMaxInitialSegments:   envInt("HLS_MAX_INITIAL_SEGMENTS", 10),
 		HLSSegmentFetchInterval: envFloat("HLS_SEGMENT_FETCH_INTERVAL", 0.5),
+
+		StreamLoopDetectionEnabled: envBool("STREAM_LOOP_DETECTION_ENABLED", false),
+		StreamLoopThreshold:        envDur("STREAM_LOOP_DETECTION_THRESHOLD_S", 3600*time.Second),
+		// 0 keeps a detected stream marked until it is cleared by hand.
+		StreamLoopRetention: time.Duration(envInt("STREAM_LOOP_RETENTION_MINUTES", 0)) * time.Minute,
 
 		MaxClientsPerStreamCount: envInt("MAX_CLIENTS_PER_STREAM", 100),
 		MaxTotalStreams:          envInt("MAX_TOTAL_STREAMS", 150),
