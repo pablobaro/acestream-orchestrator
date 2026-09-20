@@ -267,7 +267,7 @@ func (re *ReputationEngine) GetSafeHostname(
 
 			var eligible []persistence.ScoredServer
 			for _, c := range candidates {
-				if len(allowed) == 0 || allowed[strings.ToLower(c.Hostname)] {
+				if allowed[strings.ToLower(c.Hostname)] {
 					eligible = append(eligible, c)
 				}
 			}
